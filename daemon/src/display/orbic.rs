@@ -17,6 +17,9 @@ const SYSFS_SLEEP_MODE: &str = "/sys/devices/78b6000.spi/spi_master/spi1/spi1.0/
 const SYSFS_BL_GPIO: &str = "/sys/devices/78b6000.spi/spi_master/spi1/spi1.0/bl_gpio";
 const SYSFS_DISPLAY_ON: &str = "/sys/devices/78b6000.spi/spi_master/spi1/spi1.0/display_on";
 
+// Power management autosleep control (this is what fixed the battery-only flicker).
+const SYSFS_AUTOSLEEP: &str = "/sys/power/autosleep";
+
 async fn read_sysfs_bool(path: &str) -> Option<bool> {
     match tokio::fs::read_to_string(path).await {
         Ok(s) => match s.trim() {
@@ -28,11 +31,26 @@ async fn read_sysfs_bool(path: &str) -> Option<bool> {
     }
 }
 
-//
-async fn write_sysfs_one(path: &str) {
-    if let Err(e) = tokio::fs::write(path, b"1").await {
-        warn!("failed writing '1' to {path}: {e}");
+async fn read_sysfs_trimmed(path: &str) -> Option<String> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(s) => Some(s.trim().to_string()),
+        Err(_) => None,
     }
+}
+
+async fn write_sysfs_str(path: &str, value: &str) {
+    let mut v = String::from(value);
+    if !v.ends_with('\n') {
+        v.push('\n');
+    }
+
+    if let Err(e) = tokio::fs::write(path, v.as_bytes()).await {
+        warn!("failed writing {:?} to {}: {}", value, path, e);
+    }
+}
+
+async fn write_sysfs_one(path: &str) {
+    write_sysfs_str(path, "1").await
 }
 
 fn spawn_keep_screen_on(task_tracker: &TaskTracker, shutdown_token: CancellationToken) {
@@ -43,6 +61,10 @@ fn spawn_keep_screen_on(task_tracker: &TaskTracker, shutdown_token: Cancellation
             return;
         }
 
+        // Capture original autosleep so we can restore it on shutdown (best-effort).
+        // Typical values are "mem" or "off".
+        let original_autosleep = read_sysfs_trimmed(SYSFS_AUTOSLEEP).await;
+
         // Poll frequency to catch sleeping.
         const POLL_MS: u64 = 500;
 
@@ -51,7 +73,15 @@ fn spawn_keep_screen_on(task_tracker: &TaskTracker, shutdown_token: Cancellation
                 break;
             }
 
-            // On Orbic sleep_mode=0 and bl_gpio=0 indicates the display is sleep.
+            // Critical fix: prevent the system from entering suspend/resume loops on battery.
+            // autosleep=off stops constant redraw while on battery power due to wake and sleep sources.
+            let autosleep = read_sysfs_trimmed(SYSFS_AUTOSLEEP).await;
+            if autosleep.as_deref() != Some("off") {
+                debug!("keep_screen_on: forcing autosleep=off (was {:?})", autosleep);
+                write_sysfs_str(SYSFS_AUTOSLEEP, "off").await;
+            }
+
+            // On Orbic, sleep_mode=0 and bl_gpio=0 indicates the display is asleep.
             let sleep_mode = read_sysfs_bool(SYSFS_SLEEP_MODE).await;
             let bl_gpio = read_sysfs_bool(SYSFS_BL_GPIO).await;
 
@@ -63,8 +93,8 @@ fn spawn_keep_screen_on(task_tracker: &TaskTracker, shutdown_token: Cancellation
                     sleep_mode, bl_gpio
                 );
 
-                // Observed wake sequence
-                // 1) display_on=1 (this has not been observed to change but we set it anyway)
+                // Observed wake sequence:
+                // 1) display_on=1 (usually stays 1, but set anyway)
                 // 2) bl_gpio=1 (backlight)
                 // 3) sleep_mode=1 (resume UI)
                 write_sysfs_one(SYSFS_DISPLAY_ON).await;
@@ -73,6 +103,14 @@ fn spawn_keep_screen_on(task_tracker: &TaskTracker, shutdown_token: Cancellation
             }
 
             tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+        }
+
+        // Best-effort restore of autosleep on shutdown.
+        if let Some(orig) = original_autosleep {
+            // Only restore if we actually captured something meaningful.
+            // (If it was already "off", restoring "off" is harmless.)
+            debug!("keep_screen_on: restoring autosleep to {:?}", orig);
+            write_sysfs_str(SYSFS_AUTOSLEEP, &orig).await;
         }
     });
 }
