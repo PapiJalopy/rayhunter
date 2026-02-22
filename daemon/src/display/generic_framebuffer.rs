@@ -13,6 +13,83 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use include_dir::{Dir, include_dir};
 
+
+
+fn image_for_state<'a>(
+    state: DisplayState,
+    eff_default: &'a [u8],
+    eff_yellow: Option<&'a [u8]>,
+    eff_orange: Option<&'a [u8]>,
+    eff_red: Option<&'a [u8]>,
+) -> &'a [u8] {
+    match state {
+        DisplayState::WarningDetected { event_type } => match event_type {
+            EventType::Informational => eff_default,
+            EventType::Low => eff_yellow.unwrap_or(eff_default),
+            EventType::Medium => eff_orange.unwrap_or(eff_default),
+            EventType::High => eff_red.unwrap_or(eff_default),
+        },
+        DisplayState::Paused | DisplayState::Recording => eff_default,
+    }
+}
+
+// Startup self-test: cycle through the UI visuals once so you can verify both
+// the status bar style (color/pattern) and the image swapping on hardware.
+// Runs only for ui_level == 3.
+async fn run_startup_selftest(
+    fb: &mut impl GenericFramebuffer,
+    colorblind_mode: bool,
+    eff_default: &[u8],
+    eff_yellow: Option<&[u8]>,
+    eff_orange: Option<&[u8]>,
+    eff_red: Option<&[u8]>,
+) {
+    // (state, duration_ms)
+    // Visuals covered:
+    // - White: Paused
+    // - Green: Recording
+    // - Yellow: Low
+    // - Orange: Medium
+    // - Red: High
+    let sequence: &[(DisplayState, u64)] = &[
+        (DisplayState::Paused, 700),
+        (DisplayState::Recording, 700),
+        (
+            DisplayState::WarningDetected {
+                event_type: EventType::Low,
+            },
+            700,
+        ),
+        (
+            DisplayState::WarningDetected {
+                event_type: EventType::Medium,
+            },
+            700,
+        ),
+        (
+            DisplayState::WarningDetected {
+                event_type: EventType::High,
+            },
+            700,
+        ),
+    ];
+
+    for (state, ms) in sequence {
+        let (color, pattern) = display_style_from_state(*state, colorblind_mode);
+
+        // Draw the image for this state
+        let img_to_draw = image_for_state(*state, eff_default, eff_yellow, eff_orange, eff_red);
+        fb.draw_img(img_to_draw).await;
+
+        // Draw the status bar for this state
+        let status_bar_height = 8;
+        fb.draw_patterned_line(color, status_bar_height, pattern)
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(*ms)).await;
+    }
+}
+
 const REFRESH_RATE: u64 = 1000; //how often in milliseconds to refresh the display
 
 #[derive(Copy, Clone)]
@@ -101,6 +178,8 @@ pub trait GenericFramebuffer: Send + 'static {
         } else {
             resized_img = img;
         }
+
+        // NOTE: This expects RGBA; if someone supplies an RGB PNG this will panic.
         let img_rgba8 = resized_img.as_rgba8().unwrap();
         let mut buf = Vec::with_capacity((height * width).try_into().unwrap());
         for y in 0..height {
@@ -183,25 +262,68 @@ pub fn update_ui(
 
     let colorblind_mode = config.colorblind_mode;
     let mut display_style = display_style_from_state(DisplayState::Recording, colorblind_mode);
+    let mut current_state = DisplayState::Recording;
 
     task_tracker.spawn(async move {
-        // this feels wrong, is there a more rusty way to do this?
-        let mut img: Option<&[u8]> = None;
-        if display_level == 2 {
-            img = Some(
+        // Preload assets (all from include_dir, so no disk IO at runtime)
+        let gif_img: Option<&[u8]> = if display_level == 2 {
+            Some(
                 IMAGE_DIR
                     .get_file("orca.gif")
                     .expect("failed to read orca.gif")
                     .contents(),
-            );
-        } else if display_level == 3 {
-            img = Some(
+            )
+        } else {
+            None
+        };
+
+        let eff_default: Option<&[u8]> = if display_level == 3 {
+            Some(
                 IMAGE_DIR
                     .get_file("eff.png")
                     .expect("failed to read eff.png")
                     .contents(),
-            );
+            )
+        } else {
+            None
+        };
+
+        let eff_yellow: Option<&[u8]> = if display_level == 3 {
+            IMAGE_DIR.get_file("eff_yellow.png").map(|f| f.contents())
+        } else {
+            None
+        };
+
+        let eff_orange: Option<&[u8]> = if display_level == 3 {
+            IMAGE_DIR.get_file("eff_orange.png").map(|f| f.contents())
+        } else {
+            None
+        };
+
+        let eff_red: Option<&[u8]> = if display_level == 3 {
+            IMAGE_DIR.get_file("eff_red.png").map(|f| f.contents())
+        } else {
+            None
+        };
+
+        // ---- Startup self-test (ui_level 3 only) ----
+        if display_level == 3 {
+            run_startup_selftest(
+                &mut fb,
+                colorblind_mode,
+                eff_default.expect("eff.png not loaded"),
+                eff_yellow,
+                eff_orange,
+                eff_red,
+            )
+            .await;
+
+            // After self-test, return to normal appearance
+            current_state = DisplayState::Recording;
+            display_style = display_style_from_state(DisplayState::Recording, colorblind_mode);
         }
+        // --------------------------------------------
+
         loop {
             if shutdown_token.is_cancelled() {
                 info!("received UI shutdown");
@@ -209,16 +331,26 @@ pub fn update_ui(
             }
             match ui_update_rx.try_recv() {
                 Ok(state) => {
+                    current_state = state;
                     display_style = display_style_from_state(state, colorblind_mode);
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
                 Err(e) => error!("error receiving framebuffer update message: {e}"),
             }
 
-            let mut status_bar_height = 2;
+            let mut status_bar_height = 8;
             match display_level {
-                2 => fb.draw_gif(img.unwrap()).await,
-                3 => fb.draw_img(img.unwrap()).await,
+                2 => fb.draw_gif(gif_img.expect("orca.gif not loaded")).await,
+                3 => {
+                    let img_to_draw = image_for_state(
+                        current_state,
+                        eff_default.expect("eff.png not loaded"),
+                        eff_yellow,
+                        eff_orange,
+                        eff_red,
+                    );
+                    fb.draw_img(img_to_draw).await
+                }
                 4 => {
                     status_bar_height = fb.dimensions().height;
                 }
